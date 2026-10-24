@@ -27,6 +27,7 @@ class MainActivity : Activity() {
     private val sampleRate = 44100
     @Volatile private var listening = false
     private var recorder: AudioRecord? = null
+    private var selectedString: GuitarString? = null
     private lateinit var noteView: TextView
     private lateinit var frequencyView: TextView
     private lateinit var statusView: TextView
@@ -111,8 +112,9 @@ class MainActivity : Activity() {
     }
 
     private fun showStringHint(s: GuitarString) {
-        frequencyView.text = "Target ${s.name} · ${"%.2f".format(s.hz)} Hz"
-        statusView.text = "Pluck this string to tune"
+        selectedString = s
+        frequencyView.text = "Target ${stringLabel(s)} · ${"%.2f".format(s.hz)} Hz"
+        statusView.text = "Pluck ${stringLabel(s)} to tune"
     }
 
     private fun startListening() {
@@ -143,13 +145,21 @@ class MainActivity : Activity() {
     private fun audioLoop() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
         val buffer = ShortArray(8192)
+        val recentPitches = ArrayDeque<Double>()
         while (listening) {
             val count = try { recorder?.read(buffer, 0, buffer.size) ?: 0 } catch (_: Exception) { 0 }
             if (count > 2048) {
                 val samples = DoubleArray(count) { buffer[it].toDouble() / 32768.0 }
                 val rms = sqrt(samples.sumOf { it * it } / count)
-                val hz = if (rms > 0.008) detectPitch(samples, sampleRate) else -1.0
-                if (hz in 60.0..1000.0) runOnUiThread { updatePitch(hz) }
+                val hz = if (rms > 0.003) detectPitch(samples, sampleRate) else -1.0
+                if (hz in 60.0..1000.0) {
+                    recentPitches.addLast(hz)
+                    if (recentPitches.size > 5) recentPitches.removeFirst()
+                    val stableHz = recentPitches.sorted()[recentPitches.size / 2]
+                    runOnUiThread { updatePitch(stableHz) }
+                } else {
+                    recentPitches.clear()
+                }
             }
         }
     }
@@ -158,54 +168,69 @@ class MainActivity : Activity() {
         val n = x.size
         val minLag = sr / 1000
         val maxLag = minOf(sr / 60, n / 2)
-        var bestLag = -1
-        var best = 0.0
-        // Normalized autocorrelation: sufficient for a simple first version.
-        for (lag in minLag..maxLag) {
-            var cross = 0.0; var a = 0.0; var b = 0.0
-            val limit = n - lag
+        val usableSamples = n - maxLag
+        val normalized = DoubleArray(maxLag + 1)
+        var cumulative = 0.0
+
+        // YIN cumulative-mean normalized difference: choose the first convincing
+        // period, not the largest autocorrelation peak (which can be a subharmonic).
+        for (lag in 1..maxLag) {
+            var sum = 0.0
             var i = 0
-            while (i < limit) {
-                val v = x[i]; val w = x[i + lag]
-                cross += v * w; a += v * v; b += w * w
+            while (i < usableSamples) {
+                val delta = x[i] - x[i + lag]
+                sum += delta * delta
                 i += 2
             }
-            val corr = if (a > 0.0 && b > 0.0) cross / sqrt(a * b) else 0.0
-            if (corr > best) { best = corr; bestLag = lag }
+            cumulative += sum
+            normalized[lag] = if (cumulative > 0.0) sum * lag / cumulative else 1.0
         }
-        if (bestLag < 0 || best < 0.55) return -1.0
-        // Parabolic interpolation improves frequency resolution between sample lags.
-        fun correlation(lag: Int): Double {
-            var sum = 0.0; var a = 0.0; var b = 0.0
-            var i = 0
-            while (i < n - lag) { val p=x[i]; val q=x[i+lag]; sum+=p*q; a+=p*p; b+=q*q; i+=2 }
-            return if (a > 0 && b > 0) sum / sqrt(a*b) else 0.0
+
+        var bestLag = -1
+        for (lag in minLag until maxLag) {
+            if (normalized[lag] < 0.15 && normalized[lag] <= normalized[lag + 1]) {
+                bestLag = lag
+                while (bestLag + 1 < maxLag && normalized[bestLag + 1] < normalized[bestLag]) bestLag++
+                break
+            }
         }
-        val left = correlation(maxOf(minLag, bestLag - 1))
-        val center = correlation(bestLag)
-        val right = correlation(minOf(maxLag, bestLag + 1))
-        val denom = left - 2 * center + right
-        val shift = if (abs(denom) > 1e-9) 0.5 * (left - right) / denom else 0.0
-        return sr / (bestLag + shift)
+        if (bestLag < 0) {
+            bestLag = (minLag..maxLag).minByOrNull { normalized[it] } ?: return -1.0
+            if (normalized[bestLag] > 0.35) return -1.0
+        }
+
+        val left = normalized[maxOf(minLag, bestLag - 1)]
+        val center = normalized[bestLag]
+        val right = normalized[minOf(maxLag, bestLag + 1)]
+        val denominator = left - 2.0 * center + right
+        val shift = if (abs(denominator) > 1e-9) 0.5 * (left - right) / denominator else 0.0
+        val period = bestLag + shift
+        return if (period > 0.0) sr / period else -1.0
     }
 
     private fun updatePitch(hz: Double) {
         val midi = (69 + 12 * log2(hz / 440.0)).roundToInt()
         val note = notes[(midi % 12 + 12) % 12]
         val octave = midi / 12 - 1
-        val targetHz = 440.0 * Math.pow(2.0, (midi - 69) / 12.0)
-        val cents = (1200 * log2(hz / targetHz)).roundToInt().coerceIn(-50, 50)
-        noteView.text = note
-        frequencyView.text = "${"%.1f".format(hz)} Hz  ·  ${note}${octave}"
+        val nearestString = strings.minByOrNull { abs(1200 * log2(hz / it.hz)) } ?: return
+        val target = selectedString ?: nearestString
+        val cents = (1200 * log2(hz / target.hz)).roundToInt()
+        noteView.text = "$note$octave"
+        frequencyView.text = "${"%.1f".format(hz)} Hz · цель ${stringLabel(target)} (${"%.2f".format(target.hz)} Hz)"
         centsView.text = if (cents > 0) "+$cents cents" else "$cents cents"
-        needle.cents = cents.toFloat()
+        needle.cents = cents.coerceIn(-50, 50).toFloat()
         needle.invalidate()
         statusView.text = when {
-            abs(cents) <= 4 -> "IN TUNE ✓"
-            cents < 0 -> "TOO LOW · tighten the string"
-            else -> "TOO HIGH · loosen the string"
+            abs(cents) <= 4 -> "${stringLabel(target)} · IN TUNE ✓"
+            cents < 0 -> "${stringLabel(target)} · TOO LOW · tighten"
+            else -> "${stringLabel(target)} · TOO HIGH · loosen"
         }
         statusView.setTextColor(if (abs(cents) <= 4) Color.rgb(158, 230, 55) else Color.rgb(255, 190, 90))
+    }
+
+    private fun stringLabel(string: GuitarString): String {
+        val midi = (69 + 12 * log2(string.hz / 440.0)).roundToInt()
+        return "${string.name}${midi / 12 - 1}"
     }
 
     private fun stopListening() {
